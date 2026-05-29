@@ -1,0 +1,76 @@
+name: Check Warframe Devstream
+
+on:
+  schedule:
+    # 每 6 小時跑一次（UTC）。cron 時間以 GitHub 排程為準，可能有數分鐘延遲。
+    - cron: "0 */6 * * *"
+  workflow_dispatch: {}  # 允許在 Actions 頁面手動觸發
+
+# 需要寫入權限，才能 push 回 state 分支
+permissions:
+  contents: write
+
+# 避免兩次排程重疊同時 push state 分支
+concurrency:
+  group: devstream-notifier
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Restore seen.json from state branch
+        run: |
+          if git fetch origin state --depth=1 2>/dev/null; then
+            git show FETCH_HEAD:seen.json > seen.json 2>/dev/null \
+              && echo "已從 state 分支取回 seen.json" \
+              || echo "state 分支尚無 seen.json"
+          else
+            echo "尚無 state 分支（首次執行，將推播現有公告）"
+          fi
+          # 記下跑之前的 seen.json 雜湊，供 persist 步驟判斷「真變更 vs 只是心跳」
+          echo "PREV_HASH=$(sha1sum seen.json 2>/dev/null | cut -d' ' -f1)" >> "$GITHUB_ENV"
+
+      - name: Run notifier
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: python3 main.py
+
+      - name: Persist state + heartbeat to state branch
+        # 真變更 commit 保留（變更紀錄）、純心跳 commit force-push 滾動不累積；每跑必 commit 以免疫 60 天停用。
+        # if: always() 確保程式失敗時也存進度。
+        if: always()
+        run: |
+          TS=$(date -u +"%Y-%m-%dT%H:%M:%SZ"); echo "$TS" > last_run.txt
+          NEW_HASH=$(sha1sum seen.json 2>/dev/null | cut -d' ' -f1)
+          if [ -n "$NEW_HASH" ] && [ "$NEW_HASH" != "$PREV_HASH" ]; then
+            MSG="state: seen.json 有更新（偵測到新公告）@ $TS"
+          else
+            MSG="state: heartbeat（無變更）@ $TS"
+          fi
+          echo "$MSG"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git fetch origin state --depth=2 2>/dev/null; then
+            # tip 若是心跳就丟掉它、接在上一筆真變更後面；否則直接接在 tip 上
+            case "$(git log -1 --format=%s FETCH_HEAD)" in
+              *heartbeat*) BASE="FETCH_HEAD~1" ;;
+              *)           BASE="FETCH_HEAD" ;;
+            esac
+            git worktree add -B state _state "$BASE"
+          else
+            git worktree add --orphan -b state _state
+          fi
+          cp last_run.txt _state/
+          [ -f seen.json ] && cp seen.json _state/
+          git -C _state add -A
+          git -C _state commit -q --allow-empty -m "$MSG"
+          git -C _state push -f origin state
