@@ -1,4 +1,4 @@
-name: Check Warframe Devstream
+name: Check Warframe Devstream & Drops
 
 on:
   schedule:

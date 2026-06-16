@@ -1,5 +1,7 @@
 __pycache__/
 *.pyc
+.venv/
+.env
 
 # 狀態檔只存在於 state 分支，不進 main
 seen.json

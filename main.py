@@ -10,7 +10,11 @@ import xml.etree.ElementTree as ET
 
 FORUM_RSS_URL = "https://forums.warframe.com/forum/113-livestreams.xml"
 
-TITLE_PATTERN = re.compile(r"devstream", re.IGNORECASE)
+TITLE_DEVSTREAM_PATTERN = re.compile(r"devstream", re.IGNORECASE)
+# 掉寶活動帖：標題本身就點明 Twitch Drops / Drops Campaign
+TITLE_DROP_PATTERN = re.compile(r"twitch\s*drops?|drops?\s+campaign", re.IGNORECASE)
+# 每週例行週播表：內文常順帶提到 drops，但不是要推的活動，依標題整類排除
+SCHEDULE_PATTERN = re.compile(r"community\s+stream\s+schedule", re.IGNORECASE)
 TOPIC_ID_PATTERN = re.compile(r"/topic/(\d+)-")
 
 # drop 偵測只用來「標註」訊息，不決定要不要發（每篇新 Devstream 都會通知）
@@ -90,8 +94,17 @@ def parse_feed(xml_bytes):
     return items
 
 
+def select_kind(title):
+    if SCHEDULE_PATTERN.search(title):
+        return None
+    if TITLE_DEVSTREAM_PATTERN.search(title):
+        return "devstream"
+    if TITLE_DROP_PATTERN.search(title):
+        return "drop"
+    return None
+
+
 def classify_drop(text):
-    """回傳 (status, lines)。status: yes=有 drop / no=明示無 / unknown=沒抓到。"""
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     hits = [ln for ln in lines if KEYWORD_PATTERN.search(ln)
             or DROPS_PATTERN.search(ln) or EARN_PATTERN.search(ln)]
@@ -101,19 +114,26 @@ def classify_drop(text):
     return "unknown", []
 
 
-def build_message(title, link, status, lines):
-    head = {
-        "yes": "🎁 偵測到 Twitch Drop：",
-        "no": "❌ 公告說明這次沒有 Twitch Drop：",
-        "unknown": "❓ 無法自動判斷是否有 Twitch Drop，請點進公告確認。",
-    }[status]
-    if status == "unknown":
-        section = head
+def build_message(title, link, status, lines, kind="devstream"):
+    if kind == "drop":
+        # DE 的掉寶公告標題/內文格式很隨便、歷年模板多變，硬解獎勵與時間易出錯，
+        # 因此不解析內文，直接通知並導流到原文。
+        section = "🎁 這是 Twitch Drop 活動，獎勵與時間請點進公告確認。"
+    elif status == "unknown":
+        section = "❓ 無法自動判斷是否有 Twitch Drop，請點進公告確認。"
     else:
+        head = {
+            "yes": "🎁 偵測到 Twitch Drop：",
+            "no": "❌ 公告說明這次沒有 Twitch Drop：",
+        }[status]
         body = "\n".join(f"> {s[:500]}" for s in lines) if lines else "> （無內文）"
         section = f"{head}\n{body}"
+    heading = {
+        "devstream": "🎮 **新 Devstream 公告**",
+        "drop": "📣 **新 Twitch Drop 活動公告**",
+    }[kind]
     content = (
-        f"🎮 **新 Devstream 公告**\n"
+        f"{heading}\n"
         f"**{title}**\n"
         f"{section}\n"
         f"🔗 {link}"
@@ -149,26 +169,27 @@ def main():
 
     log(f"抓取 RSS：{FORUM_RSS_URL}")
     items = parse_feed(http_get(FORUM_RSS_URL))
-    devstreams = [it for it in items if TITLE_PATTERN.search(it["title"])]
-    log(f"RSS 共 {len(items)} 篇，其中 Devstream {len(devstreams)} 篇")
+    candidates = [it for it in items if select_kind(it["title"])]
+    log(f"RSS 共 {len(items)} 篇，其中要追蹤 {len(candidates)} 篇（Devstream + Twitch Drop 活動）")
 
-    # 首次部署時 seen 為空 → 目前 feed 的所有 Devstream 都會推送一次
+    # 首次部署時 seen 為空 → 目前 feed 的所有候選都會推送一次
     new_items = sorted(
-        (it for it in devstreams if it["topic_id"] not in seen),
+        (it for it in candidates if it["topic_id"] not in seen),
         key=lambda it: int(it["topic_id"]),
     )
     if not new_items:
-        log("沒有新的 Devstream 公告。")
+        log("沒有新的公告。")
         return
 
     if not DISCORD_WEBHOOK_URL:
         log("⚠ 未設定 DISCORD_WEBHOOK_URL，無法發送通知。")
 
-    feed_ids = {it["topic_id"] for it in devstreams}
+    feed_ids = {it["topic_id"] for it in candidates}
     failures = 0
     try:
         for it in new_items:
-            log(f"新公告：{it['title']}（id={it['topic_id']}）")
+            kind = select_kind(it["title"])
+            log(f"新公告[{kind}]：{it['title']}（id={it['topic_id']}）")
             status, lines = classify_drop(it["description_text"])
 
             if not DISCORD_WEBHOOK_URL:
@@ -177,8 +198,8 @@ def main():
                 continue
 
             try:
-                send_discord(build_message(it["title"], it["link"], status, lines))
-                log(f"  · 已發送 Discord（{status}）")
+                send_discord(build_message(it["title"], it["link"], status, lines, kind))
+                log(f"  · 已發送 Discord（{kind}/{status}）")
             except Exception as e:
                 failures += 1
                 log(f"  · {SEND_ATTEMPTS} 次都失敗，放棄這篇：{e}")
